@@ -20,8 +20,8 @@ class CameraApp(tk.Tk):
 
         - Camera objects
         - Camera registry
-        - Camera worker threads
-        - Camera stream lifecycle
+        - Camera worker lifecycle
+        - Camera stream start/stop decisions
 
     GUI pages must NEVER directly call:
 
@@ -29,31 +29,38 @@ class CameraApp(tk.Tk):
         cam.stop()
         stop_all_cameras()
 
-    GUI pages should instead use:
+    GUI pages should use:
 
         controller.get_cameras()
-        controller.start_camera(cam)
-        controller.stop_camera(cam)
+        controller.get_camera(camera_id)
+        controller.start_camera(camera)
+        controller.stop_camera(camera)
+        controller.set_camera_status(camera, enabled)
+        controller.update_camera_configuration(...)
         controller.reload_cameras()
 
     Camera status:
 
-        status = 1
+        status = ON
             Camera is enabled and may run.
 
-        status = 0
+        status = OFF
             Camera is disabled / under maintenance.
             Its stream MUST NOT run.
 
-    Page switching never stops camera streams.
+    Page switching NEVER stops camera streams.
 
-    Camera streams are stopped only when:
+    Streams are stopped only when:
 
-        1. A camera is explicitly disabled.
-        2. A camera is deleted.
-        3. A camera connection configuration is changed.
-        4. The entire application is closed.
+        1. Camera is explicitly disabled.
+        2. Camera is deleted.
+        3. Camera connection configuration changes.
+        4. Application is closed.
     """
+
+    # =============================================================
+    # INITIALIZATION
+    # =============================================================
 
     def __init__(self):
 
@@ -69,7 +76,7 @@ class CameraApp(tk.Tk):
         #
         # This is the SINGLE source of truth for Camera objects.
         #
-        # MainPage and DeviceManagerPage must use these objects.
+        # Every page receives references to these SAME objects.
         #
         self.cameras = []
 
@@ -79,8 +86,8 @@ class CameraApp(tk.Tk):
         #
         # camera_id -> Camera object
         #
-        # Only cameras that CameraApp has started should appear
-        # here.
+        # Only cameras whose streams are currently managed as
+        # running by CameraApp should be stored here.
         #
         self.camera_streams = {}
 
@@ -138,7 +145,7 @@ class CameraApp(tk.Tk):
         )
 
         # =========================================================
-        # LOAD CAMERAS
+        # LOAD SHARED CAMERAS
         # =========================================================
 
         self._load_cameras()
@@ -243,9 +250,10 @@ class CameraApp(tk.Tk):
 
         This is called once during application startup.
 
-        Only CameraApp creates the initial Camera objects.
+        CameraApp creates the initial Camera objects.
 
-        Pages receive references to these same objects.
+        GUI pages must use these shared objects instead of loading
+        their own Camera instances.
         """
 
         try:
@@ -277,12 +285,14 @@ class CameraApp(tk.Tk):
 
     def get_cameras(self):
         """
-        Return a copy of the shared Camera registry.
+        Return a copy of the camera registry.
+
+        The list is copied.
 
         The Camera objects themselves are NOT copied.
 
-        Every caller receives references to the same Camera
-        instances owned by CameraApp.
+        Every caller receives references to the same shared
+        Camera instances.
         """
 
         with self.camera_lock:
@@ -320,8 +330,9 @@ class CameraApp(tk.Tk):
         """
         Register a newly created Camera object.
 
-        Returns the existing shared object if the camera ID
-        is already registered.
+        The Camera object becomes owned by CameraApp.
+
+        If the camera is disabled, its stream is NOT started.
         """
 
         if camera is None:
@@ -330,19 +341,15 @@ class CameraApp(tk.Tk):
 
         with self.camera_lock:
 
-            existing = None
+            # -----------------------------------------------------
+            # Prevent duplicate objects.
+            # -----------------------------------------------------
 
-            for cam in self.cameras:
+            for existing in self.cameras:
 
-                if cam.id == camera.id:
+                if existing.id == camera.id:
 
-                    existing = cam
-
-                    break
-
-            if existing is not None:
-
-                return existing
+                    return existing
 
             self.cameras.append(
                 camera
@@ -353,6 +360,24 @@ class CameraApp(tk.Tk):
             f"{camera.id}"
         )
 
+        # ---------------------------------------------------------
+        # Enforce status.
+        # ---------------------------------------------------------
+
+        if self.is_camera_enabled(
+            camera
+        ):
+
+            self.start_camera(
+                camera
+            )
+
+        else:
+
+            self.stop_camera(
+                camera
+            )
+
         return camera
 
     def unregister_camera(
@@ -362,9 +387,9 @@ class CameraApp(tk.Tk):
         """
         Permanently remove a camera.
 
-        The shared stream is stopped first.
+        The stream is stopped first.
 
-        This should only be used when a camera is deleted.
+        This should only be called when a camera is deleted.
         """
 
         camera = self.get_camera(
@@ -376,7 +401,7 @@ class CameraApp(tk.Tk):
             return
 
         # ---------------------------------------------------------
-        # STOP SHARED STREAM
+        # Stop shared stream.
         # ---------------------------------------------------------
 
         self.stop_camera(
@@ -384,7 +409,7 @@ class CameraApp(tk.Tk):
         )
 
         # ---------------------------------------------------------
-        # REMOVE FROM REGISTRY
+        # Remove from registry.
         # ---------------------------------------------------------
 
         with self.camera_lock:
@@ -409,15 +434,24 @@ class CameraApp(tk.Tk):
         camera
     ):
         """
-        Return True if the camera is enabled.
+        Return True when the camera status means ON.
 
-        status may come from SQLite as:
+        Supported values:
 
-            0 / 1
-            False / True
-            "0" / "1"
-            "false" / "true"
-            "no" / "yes"
+            1
+            0
+            True
+            False
+            "1"
+            "0"
+            "true"
+            "false"
+            "yes"
+            "no"
+            "on"
+            "off"
+            "enabled"
+            "disabled"
         """
 
         if camera is None:
@@ -442,13 +476,35 @@ class CameraApp(tk.Tk):
             str
         ):
 
-            return status.lower().strip() in (
+            normalized = (
+                status
+                .strip()
+                .lower()
+            )
+
+            if normalized in (
                 "1",
                 "true",
                 "yes",
                 "on",
                 "enabled"
-            )
+            ):
+
+                return True
+
+            if normalized in (
+                "0",
+                "false",
+                "no",
+                "off",
+                "disabled",
+                "",
+                "none"
+            ):
+
+                return False
+
+            return False
 
         try:
 
@@ -472,13 +528,17 @@ class CameraApp(tk.Tk):
         camera
     ):
         """
-        Start a shared camera stream.
-
-        IMPORTANT:
+        Start one shared camera stream.
 
         A camera with status OFF is NEVER started.
 
-        Repeated calls are safe.
+        Returns:
+
+            True
+                Stream is running or was successfully started.
+
+            False
+                Camera was disabled or failed to start.
         """
 
         if camera is None:
@@ -489,46 +549,52 @@ class CameraApp(tk.Tk):
 
             return False
 
-        # ---------------------------------------------------------
-        # STATUS CHECK
-        # ---------------------------------------------------------
-        #
-        # Maintenance cameras must not consume resources.
-        #
-        if not self.is_camera_enabled(
-            camera
-        ):
-
-            print(
-                f"[CameraApp] Camera "
-                f"{getattr(camera, 'id', '?')} "
-                f"is disabled. Stream will not start."
-            )
-
-            # Defensive cleanup in case something previously
-            # started this camera.
-            self.stop_camera(
-                camera
-            )
-
-            return False
-
         camera_id = getattr(
             camera,
             "id",
             None
         )
 
+        # ---------------------------------------------------------
+        # STATUS CHECK
+        # ---------------------------------------------------------
+        #
+        # This is the most important rule:
+        #
+        # OFF cameras must never consume RTSP/OpenCV resources.
+        #
+
+        if not self.is_camera_enabled(
+            camera
+        ):
+
+            # Defensive cleanup.
+            #
+            # If another part of the program somehow started
+            # this camera, force it back into the correct state.
+            self.stop_camera(
+                camera
+            )
+
+            return False
+
         try:
 
             with self.camera_lock:
 
                 # -------------------------------------------------
-                # Already tracked
+                # Already tracked.
                 # -------------------------------------------------
 
-                if camera_id in self.camera_streams:
+                tracked_camera = (
+                    self.camera_streams.get(
+                        camera_id
+                    )
+                )
 
+                if tracked_camera is camera:
+
+                    # Stream is already managed.
                     if getattr(
                         camera,
                         "running",
@@ -538,17 +604,7 @@ class CameraApp(tk.Tk):
                         return True
 
                 # -------------------------------------------------
-                # Defensive status check again
-                # -------------------------------------------------
-
-                if not self.is_camera_enabled(
-                    camera
-                ):
-
-                    return False
-
-                # -------------------------------------------------
-                # Start Camera worker
+                # Camera is not tracked or stopped unexpectedly.
                 # -------------------------------------------------
 
                 if hasattr(
@@ -559,7 +615,7 @@ class CameraApp(tk.Tk):
                     camera.start()
 
                 # -------------------------------------------------
-                # Track active stream
+                # Track active stream.
                 # -------------------------------------------------
 
                 self.camera_streams[
@@ -580,6 +636,13 @@ class CameraApp(tk.Tk):
                 f"{camera_id}: {e}"
             )
 
+            with self.camera_lock:
+
+                self.camera_streams.pop(
+                    camera_id,
+                    None
+                )
+
             return False
 
     def stop_camera(
@@ -589,8 +652,10 @@ class CameraApp(tk.Tk):
         """
         Stop one shared camera stream.
 
-        GUI pages should call this method instead of calling
-        Camera.stop() directly.
+        GUI pages must NOT call Camera.stop() directly.
+
+        This method is safe to call even if the camera is not
+        currently running.
         """
 
         if camera is None:
@@ -632,14 +697,15 @@ class CameraApp(tk.Tk):
         self
     ):
         """
-        Start all cameras whose status is enabled.
+        Start all enabled cameras.
 
-        Cameras with status OFF are explicitly stopped.
+        Disabled cameras are explicitly stopped.
+
+        This is useful after application initialization or after
+        a configuration reload.
         """
 
-        cameras = self.get_cameras()
-
-        for camera in cameras:
+        for camera in self.get_cameras():
 
             if self.is_camera_enabled(
                 camera
@@ -661,7 +727,8 @@ class CameraApp(tk.Tk):
         """
         Compatibility wrapper.
 
-        Despite the name, this does NOT start disabled cameras.
+        Despite the method name, disabled cameras are NEVER
+        started.
 
         Only cameras with status ON are started.
         """
@@ -672,10 +739,12 @@ class CameraApp(tk.Tk):
         self
     ):
         """
-        Stop every currently active shared camera stream.
+        Stop every currently active camera stream.
 
-        This should normally only be used during application
-        shutdown or an explicit global stop operation.
+        Normally used only during application shutdown or an
+        explicit global stop operation.
+
+        Page switching must NOT call this method.
         """
 
         with self.camera_lock:
@@ -699,7 +768,7 @@ class CameraApp(tk.Tk):
         )
 
     # =============================================================
-    # UPDATE CAMERA STATUS
+    # CAMERA STATUS UPDATE
     # =============================================================
 
     def set_camera_status(
@@ -710,34 +779,36 @@ class CameraApp(tk.Tk):
         """
         Change the runtime status of a camera.
 
-        enabled = False
-            Immediately stop the camera.
+        enabled=False:
 
-        enabled = True
-            Start the camera.
+            Camera is immediately stopped.
 
-        This method should be used by DeviceManagerPage instead
-        of directly calling cam.start() / cam.stop().
+        enabled=True:
+
+            Camera is allowed to run and is started.
+
+        DeviceManagerPage should use this method when the user
+        enables or disables a camera.
         """
 
         if camera is None:
 
             return False
 
-        status = (
+        new_status = (
             1
             if enabled
             else 0
         )
 
         # ---------------------------------------------------------
-        # Update Camera object
+        # Update shared Camera object.
         # ---------------------------------------------------------
 
-        camera.status = status
+        camera.status = new_status
 
         # ---------------------------------------------------------
-        # Disabled
+        # OFF
         # ---------------------------------------------------------
 
         if not enabled:
@@ -755,7 +826,7 @@ class CameraApp(tk.Tk):
             return False
 
         # ---------------------------------------------------------
-        # Enabled
+        # ON
         # ---------------------------------------------------------
 
         print(
@@ -786,29 +857,30 @@ class CameraApp(tk.Tk):
         """
         Update a shared Camera object in-place.
 
-        The same Camera object remains shared between all pages.
+        The same Camera object is preserved.
 
         Connection changes:
 
             1. Stop current stream.
-            2. Update configuration.
+            2. Update connection information.
             3. Rebuild RTSP URL.
-            4. Restart only if status is enabled.
+            4. Restart if status is ON.
 
         Status OFF:
 
-            Stream remains stopped.
+            Stream is always stopped.
 
-        Returns True on success.
+        Non-connection changes such as name or zone do NOT restart
+        the camera unnecessarily.
         """
 
         if camera is None:
 
             return False
 
-        # ---------------------------------------------------------
-        # Determine new values
-        # ---------------------------------------------------------
+        # =========================================================
+        # DETERMINE NEW VALUES
+        # =========================================================
 
         new_ip = (
             camera.ip
@@ -852,16 +924,19 @@ class CameraApp(tk.Tk):
             else zone
         )
 
-        # Normalize status.
+        # =========================================================
+        # NORMALIZE STATUS
+        # =========================================================
 
         if isinstance(
             new_status,
             str
         ):
 
-            new_status = (
-                1
-                if new_status.lower().strip()
+            new_status_enabled = (
+                new_status
+                .strip()
+                .lower()
                 in (
                     "1",
                     "true",
@@ -869,6 +944,11 @@ class CameraApp(tk.Tk):
                     "on",
                     "enabled"
                 )
+            )
+
+            new_status = (
+                1
+                if new_status_enabled
                 else 0
             )
 
@@ -880,40 +960,42 @@ class CameraApp(tk.Tk):
                 else 0
             )
 
-        # ---------------------------------------------------------
-        # Detect connection changes
-        # ---------------------------------------------------------
+            new_status_enabled = (
+                bool(new_status)
+            )
+
+        # =========================================================
+        # DETECT CONNECTION CHANGES
+        # =========================================================
 
         connection_changed = (
-            new_ip
-            != camera.ip
-            or new_port
-            != camera.port
-            or new_username
-            != (
-                camera.username
-                or ""
+            new_ip != camera.ip
+            or new_port != camera.port
+            or (
+                new_username
+                != (
+                    camera.username
+                    or ""
+                )
             )
-            or new_password
-            != (
-                camera.password
-                or ""
+            or (
+                new_password
+                != (
+                    camera.password
+                    or ""
+                )
             )
         )
 
-        old_status = (
+        old_status_enabled = (
             self.is_camera_enabled(
                 camera
             )
         )
 
-        new_status_enabled = (
-            bool(new_status)
-        )
-
-        # ---------------------------------------------------------
-        # Stop before changing connection information
-        # ---------------------------------------------------------
+        # =========================================================
+        # STOP BEFORE CONNECTION CHANGE
+        # =========================================================
 
         if connection_changed:
 
@@ -921,9 +1003,9 @@ class CameraApp(tk.Tk):
                 camera
             )
 
-        # ---------------------------------------------------------
-        # Update SAME Camera object
-        # ---------------------------------------------------------
+        # =========================================================
+        # UPDATE SAME SHARED OBJECT
+        # =========================================================
 
         camera.ip = new_ip
         camera.port = new_port
@@ -933,29 +1015,31 @@ class CameraApp(tk.Tk):
         camera.status = new_status
         camera.zone = new_zone
 
-        # ---------------------------------------------------------
-        # Rebuild RTSP URL
-        # ---------------------------------------------------------
+        # =========================================================
+        # REBUILD RTSP URL
+        # =========================================================
 
-        try:
+        if connection_changed:
 
-            if hasattr(
-                camera,
-                "_update_url"
-            ):
+            try:
 
-                camera._update_url()
+                if hasattr(
+                    camera,
+                    "_update_url"
+                ):
 
-        except Exception as e:
+                    camera._update_url()
 
-            print(
-                "[CameraApp] Failed to rebuild "
-                f"camera URL: {e}"
-            )
+            except Exception as e:
 
-        # ---------------------------------------------------------
-        # Status OFF
-        # ---------------------------------------------------------
+                print(
+                    "[CameraApp] Failed to rebuild "
+                    f"camera URL: {e}"
+                )
+
+        # =========================================================
+        # STATUS OFF
+        # =========================================================
 
         if not new_status_enabled:
 
@@ -965,45 +1049,76 @@ class CameraApp(tk.Tk):
 
             return True
 
-        # ---------------------------------------------------------
-        # Connection changed or camera was previously OFF
-        # ---------------------------------------------------------
+        # =========================================================
+        # CONNECTION CHANGED
+        # =========================================================
 
-        if (
-            connection_changed
-            or not old_status
-        ):
+        if connection_changed:
 
             self.start_camera(
                 camera
             )
 
+            return True
+
+        # =========================================================
+        # CAMERA WAS PREVIOUSLY OFF
+        # =========================================================
+
+        if not old_status_enabled:
+
+            self.start_camera(
+                camera
+            )
+
+            return True
+
+        # =========================================================
+        # CAMERA WAS ALREADY RUNNING/ENABLED
+        # =========================================================
+
+        # No restart required.
+        #
+        # Name / zone / other metadata changes are already applied
+        # to the shared object.
+
         return True
 
     # =============================================================
-    # CAMERA RELOAD
+    # CAMERA DATABASE RELOAD
     # =============================================================
 
     def reload_cameras(
         self
     ):
         """
-        Synchronize the camera registry with the database.
+        Synchronize CameraApp's shared camera registry with the DB.
 
         Existing Camera objects are preserved whenever possible.
 
-        This is critical because GUI pages may hold references
-        to the shared Camera objects.
+        This is critical because GUI pages may hold references to
+        the shared Camera objects.
 
-        Cameras that disappear from the database are stopped and
-        removed from the registry.
+        Behavior:
 
-        Cameras with status OFF are always stopped.
+            Existing camera:
+                Same object is updated in-place.
 
-        Cameras with status ON that were previously running remain
-        running.
+            Deleted camera:
+                Stream is stopped and object is removed.
 
-        Newly enabled cameras may be started.
+            Status OFF:
+                Stream is stopped.
+
+            Status ON:
+                Existing running stream is preserved.
+
+            Newly added enabled camera:
+                Stream is started.
+
+            Connection changed:
+                Existing stream is stopped before URL/config update,
+                then restarted if enabled.
         """
 
         try:
@@ -1013,9 +1128,9 @@ class CameraApp(tk.Tk):
                 or []
             )
 
-            # -----------------------------------------------------
-            # Snapshot old registry
-            # -----------------------------------------------------
+            # =====================================================
+            # SNAPSHOT OLD REGISTRY
+            # =====================================================
 
             with self.camera_lock:
 
@@ -1028,25 +1143,23 @@ class CameraApp(tk.Tk):
                     for camera in old_cameras
                 }
 
-                active_streams = dict(
-                    self.camera_streams
-                )
-
-            # -----------------------------------------------------
-            # Build new shared registry
-            # -----------------------------------------------------
+            # =====================================================
+            # BUILD NEW REGISTRY
+            # =====================================================
 
             new_cameras = []
 
             for fresh in fresh_cameras:
 
-                existing = old_by_id.get(
-                    fresh.id
+                existing = (
+                    old_by_id.get(
+                        fresh.id
+                    )
                 )
 
-                # =================================================
+                # -------------------------------------------------
                 # NEW CAMERA
-                # =================================================
+                # -------------------------------------------------
 
                 if existing is None:
 
@@ -1056,29 +1169,39 @@ class CameraApp(tk.Tk):
 
                     continue
 
-                # =================================================
-                # EXISTING CAMERA
-                # =================================================
+                # -------------------------------------------------
+                # DETECT CONNECTION CHANGE
+                # -------------------------------------------------
 
                 connection_changed = (
                     existing.ip
                     != fresh.ip
                     or existing.port
                     != fresh.port
-                    or existing.username
-                    != (
-                        fresh.username
-                        or ""
+                    or (
+                        existing.username
+                        != (
+                            fresh.username
+                            or ""
+                        )
                     )
-                    or existing.password
-                    != (
-                        fresh.password
-                        or ""
+                    or (
+                        existing.password
+                        != (
+                            fresh.password
+                            or ""
+                        )
+                    )
+                )
+
+                was_enabled = (
+                    self.is_camera_enabled(
+                        existing
                     )
                 )
 
                 # -------------------------------------------------
-                # If connection changed, stop BEFORE updating URL.
+                # Stop before changing connection settings.
                 # -------------------------------------------------
 
                 if connection_changed:
@@ -1088,7 +1211,7 @@ class CameraApp(tk.Tk):
                     )
 
                 # -------------------------------------------------
-                # Update same object
+                # Update SAME object.
                 # -------------------------------------------------
 
                 existing.modbus = (
@@ -1124,32 +1247,58 @@ class CameraApp(tk.Tk):
                 )
 
                 # -------------------------------------------------
-                # Rebuild URL
+                # Rebuild URL if connection changed.
                 # -------------------------------------------------
 
-                try:
+                if connection_changed:
 
-                    if hasattr(
-                        existing,
-                        "_update_url"
-                    ):
+                    try:
 
-                        existing._update_url()
+                        if hasattr(
+                            existing,
+                            "_update_url"
+                        ):
 
-                except Exception as e:
+                            existing._update_url()
 
-                    print(
-                        "[CameraApp] Failed to update "
-                        f"camera URL: {e}"
-                    )
+                    except Exception as e:
+
+                        print(
+                            "[CameraApp] Failed to update "
+                            f"camera URL: {e}"
+                        )
 
                 new_cameras.append(
                     existing
                 )
 
-            # -----------------------------------------------------
-            # Detect deleted cameras
-            # -----------------------------------------------------
+                # -------------------------------------------------
+                # Enforce new status.
+                # -------------------------------------------------
+
+                if not self.is_camera_enabled(
+                    existing
+                ):
+
+                    self.stop_camera(
+                        existing
+                    )
+
+                elif connection_changed:
+
+                    self.start_camera(
+                        existing
+                    )
+
+                elif not was_enabled:
+
+                    self.start_camera(
+                        existing
+                    )
+
+            # =====================================================
+            # FIND DELETED CAMERAS
+            # =====================================================
 
             new_ids = {
                 camera.id
@@ -1166,9 +1315,9 @@ class CameraApp(tk.Tk):
                 - new_ids
             )
 
-            # -----------------------------------------------------
-            # Stop deleted cameras
-            # -----------------------------------------------------
+            # =====================================================
+            # STOP DELETED CAMERA STREAMS
+            # =====================================================
 
             for camera_id in removed_ids:
 
@@ -1189,9 +1338,9 @@ class CameraApp(tk.Tk):
                         old_camera
                     )
 
-            # -----------------------------------------------------
-            # Replace registry
-            # -----------------------------------------------------
+            # =====================================================
+            # REPLACE REGISTRY
+            # =====================================================
 
             with self.camera_lock:
 
@@ -1199,51 +1348,33 @@ class CameraApp(tk.Tk):
                     new_cameras
                 )
 
-            # -----------------------------------------------------
-            # Enforce status
-            # -----------------------------------------------------
+            # =====================================================
+            # HANDLE NEW CAMERAS
+            # =====================================================
+
             #
-            # This is important:
+            # New cameras were not in old_by_id.
             #
-            # If a camera was changed to status OFF in the DB,
-            # its stream must be stopped.
+            # Start them only when status is ON.
             #
-            # If it is ON, we leave its existing stream state
-            # alone unless it was newly added.
-            #
+
             for camera in new_cameras:
 
-                if not self.is_camera_enabled(
-                    camera
-                ):
+                if camera.id not in old_by_id:
 
-                    self.stop_camera(
+                    if self.is_camera_enabled(
                         camera
-                    )
+                    ):
 
-            # -----------------------------------------------------
-            # Start newly enabled cameras
-            # -----------------------------------------------------
-            #
-            # Only cameras that were not previously active are
-            # started here.
-            #
-            for camera in new_cameras:
+                        self.start_camera(
+                            camera
+                        )
 
-                if not self.is_camera_enabled(
-                    camera
-                ):
+                    else:
 
-                    continue
-
-                if camera.id not in active_streams:
-
-                    # Do not automatically start every camera
-                    # unless the application wants all enabled
-                    # cameras active.
-                    #
-                    # MainPage can explicitly request streams.
-                    continue
+                        self.stop_camera(
+                            camera
+                        )
 
             print(
                 f"[CameraApp] Reloaded "
@@ -1260,6 +1391,56 @@ class CameraApp(tk.Tk):
             )
 
             return self.get_cameras()
+
+    # =============================================================
+    # CAMERA STREAM RECONCILIATION
+    # =============================================================
+
+    def reconcile_camera_stream(
+        self,
+        camera,
+        connection_changed=False
+    ):
+        """
+        Force a camera's runtime stream state to match its status.
+
+        This is useful after external changes to a Camera object.
+
+        Rules:
+
+            OFF:
+                Stop.
+
+            ON + connection changed:
+                Stop, then restart.
+
+            ON:
+                Start if needed.
+        """
+
+        if camera is None:
+
+            return False
+
+        if not self.is_camera_enabled(
+            camera
+        ):
+
+            self.stop_camera(
+                camera
+            )
+
+            return False
+
+        if connection_changed:
+
+            self.stop_camera(
+                camera
+            )
+
+        return self.start_camera(
+            camera
+        )
 
     # =============================================================
     # HEADER
@@ -1292,6 +1473,16 @@ class CameraApp(tk.Tk):
         Switching pages NEVER stops camera streams.
 
         CameraApp remains the owner of all active streams.
+
+        Page on_hide() is only for page-specific resources such as:
+
+            - PLC monitoring
+            - timers
+            - animations
+            - GUI previews
+            - temporary callbacks
+
+        A page MUST NOT stop shared Camera workers in on_hide().
         """
 
         if self.closing:
@@ -1313,13 +1504,14 @@ class CameraApp(tk.Tk):
 
             return
 
-        # ---------------------------------------------------------
-        # Hide current page
-        # ---------------------------------------------------------
+        # =========================================================
+        # HIDE CURRENT PAGE
+        # =========================================================
 
         if (
             self.current_frame is not None
-            and self.current_frame
+            and
+            self.current_frame
             != target_frame
         ):
 
@@ -1339,9 +1531,9 @@ class CameraApp(tk.Tk):
                         e
                     )
 
-        # ---------------------------------------------------------
-        # Switch page
-        # ---------------------------------------------------------
+        # =========================================================
+        # SWITCH PAGE
+        # =========================================================
 
         self.current_frame = (
             target_frame
@@ -1349,9 +1541,9 @@ class CameraApp(tk.Tk):
 
         target_frame.tkraise()
 
-        # ---------------------------------------------------------
-        # Show target page
-        # ---------------------------------------------------------
+        # =========================================================
+        # SHOW TARGET PAGE
+        # =========================================================
 
         if hasattr(
             target_frame,
@@ -1379,6 +1571,10 @@ class CameraApp(tk.Tk):
     ):
         """
         Change the MainPage camera grid layout.
+
+        This only changes GUI layout.
+
+        It does not control global camera lifecycle.
         """
 
         main_page = (
@@ -1426,8 +1622,8 @@ class CameraApp(tk.Tk):
         """
         Shut down the entire application.
 
-        This is the ONLY normal place where all camera streams
-        are stopped globally.
+        This is the ONLY normal place where all shared camera
+        streams are stopped globally.
         """
 
         if self.closing:
@@ -1468,17 +1664,15 @@ class CameraApp(tk.Tk):
         #
         # IMPORTANT:
         #
-        # We do NOT call stop_all_cameras() on pages.
+        # We do NOT call:
         #
-        # Pages may clean up:
+        #     frame.stop_all_cameras()
         #
-        #   - PLC readers
-        #   - timers
-        #   - preview widgets
-        #   - GUI-only resources
+        # CameraApp already owns and stopped all camera streams.
         #
-        # But they must not stop shared camera workers.
+        # Pages may clean up their own non-camera resources.
         #
+
         for frame in self.frames.values():
 
             if hasattr(
@@ -1521,6 +1715,7 @@ class CameraApp(tk.Tk):
             self.quit()
 
         except Exception:
+
             pass
 
         try:
@@ -1528,21 +1723,27 @@ class CameraApp(tk.Tk):
             self.destroy()
 
         except Exception:
+
             pass
 
+        # =========================================================
+        # EXIT PROCESS
+        # =========================================================
+
         sys.exit(0)
-    def reconcile_camera_stream(self, camera, connection_changed=False):
+    def update_camera_stream(self, camera, connection_changed=False):
         if camera is None:
             return
 
-        # OFF = stream must not run
+        # Disabled / maintenance cameras NEVER run
         if not getattr(camera, "status", False):
             self.stop_camera(camera)
             return
 
-        # Connection changed while enabled
+        # Connection settings changed:
+        # restart the stream using the new RTSP URL.
         if connection_changed:
             self.stop_camera(camera)
 
-        # ON = stream should run
+        # Enabled cameras should be running.
         self.start_camera(camera)
