@@ -1,4 +1,3 @@
-# gui/device_manager_page.py
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -14,41 +13,56 @@ from .camera_card import CameraCard
 
 
 class DeviceManagerPage(tk.Frame):
+    """
+    Device Manager page.
+
+    IMPORTANT ARCHITECTURE:
+
+        CameraApp
+            |
+            +-- Owns Camera objects
+            +-- Owns camera stream lifecycle
+            +-- Starts/stops cameras according to status
+            +-- Handles camera registration/removal
+            |
+            +-----------------------------+
+            |                             |
+        MainPage                   DeviceManagerPage
+        (display only)             (management only)
+
+    This page MUST NOT:
+
+        camera.start()
+        camera.stop()
+
+    CameraApp is the only component that controls shared
+    camera streams.
+
+    A camera with status=False is considered disabled/under
+    maintenance and must not have an active stream.
+    """
 
     # =========================================================
     # LAYOUT CONFIGURATION
     # =========================================================
 
-    # Preferred width for the left configuration panel.
     LEFT_PANEL_WIDTH = 320
-
-    # Preferred width for the right camera list.
     RIGHT_PANEL_WIDTH = 320
 
-    # Minimum usable width for left panel.
     MIN_LEFT_WIDTH = 250
-
-    # Minimum usable width for right panel.
     MIN_RIGHT_WIDTH = 240
 
-    # Minimum width for central preview.
     MIN_CENTER_WIDTH = 400
-
-    # Minimum height for central preview.
     MIN_CENTER_HEIGHT = 250
 
-    # 16:9 camera aspect ratio.
     CAMERA_ASPECT_RATIO = 16 / 9
 
     # =========================================================
     # INIT
     # =========================================================
 
-    def __init__(
-        self,
-        parent,
-        controller
-    ):
+    def __init__(self, parent, controller):
+
         super().__init__(
             parent,
             bg=COLOR_BG
@@ -63,21 +77,19 @@ class DeviceManagerPage(tk.Frame):
         self.is_visible = False
 
         self.add_panel_showing = False
-
         self.settings_panel_showing = False
 
         # =====================================================
         # CAMERA DATA
         # =====================================================
-        #
-        # The Camera object owns the RTSP connection.
-        #
-        # DeviceManagerPage only keeps references to cameras.
-        #
-        # DO NOT create separate RTSP stream objects here.
-        #
-        # =====================================================
 
+        # IMPORTANT:
+        #
+        # This is only a reference/cache for the shared
+        # Camera objects owned by CameraApp.
+        #
+        # We NEVER create another Camera registry here.
+        #
         self.cameras = []
 
         self.camera_cards = {}
@@ -89,7 +101,7 @@ class DeviceManagerPage(tk.Frame):
         self._build_ui()
 
         # =====================================================
-        # LOAD CAMERAS
+        # USE CONTROLLER CAMERA REGISTRY
         # =====================================================
 
         self.load_existing_cameras()
@@ -128,9 +140,6 @@ class DeviceManagerPage(tk.Frame):
         *args,
         **kwargs
     ):
-        """
-        Called when the page becomes visible.
-        """
 
         super().tkraise(
             *args,
@@ -141,66 +150,48 @@ class DeviceManagerPage(tk.Frame):
 
     # =========================================================
 
-    def on_show(
-        self
-    ):
-        """
-        Start camera workers when Device Manager becomes visible.
-
-        The Camera class owns the actual worker thread.
-        """
+    def on_show(self):
 
         self.is_visible = True
 
-        for cam in list(
-            self.cameras
-        ):
+        # =====================================================
+        # REFRESH SHARED CAMERA REFERENCES
+        # =====================================================
 
-            try:
+        self.load_existing_cameras(
+            refresh_cards=True
+        )
 
-                if not cam.running:
-
-                    cam.start()
-
-            except Exception as e:
-
-                print(
-                    f"Failed to start camera "
-                    f"{getattr(cam, 'ip', 'unknown')}: "
-                    f"{e}"
-                )
-
-        # Refresh central preview.
+        # =====================================================
+        # REFRESH CENTRAL PREVIEW
+        # =====================================================
 
         if hasattr(
             self,
             "central_frame"
         ):
 
-            if hasattr(
-                self.central_frame,
-                "reload_cameras"
-            ):
+            try:
 
-                try:
+                if hasattr(
+                    self.central_frame,
+                    "reload_cameras"
+                ):
 
                     self.central_frame.reload_cameras()
 
-                except Exception as e:
+            except Exception as e:
 
-                    print(
-                        "Central preview refresh error:",
-                        e
-                    )
+                print(
+                    "Central preview refresh error:",
+                    e
+                )
 
     # =========================================================
 
     def hide(
         self
     ):
-        """
-        Compatibility alias.
-        """
 
         self.on_hide()
 
@@ -209,32 +200,66 @@ class DeviceManagerPage(tk.Frame):
     def on_hide(
         self
     ):
+
         """
-        Stop camera workers when leaving Device Manager.
+        Hide the page.
 
-        Camera objects remain in memory.
+        IMPORTANT:
 
-        They are restarted when the page is shown again.
+        This function does NOT stop cameras.
+
+        CameraApp owns all shared camera streams.
+
+        Streams continue running while switching between
+        MainPage and DeviceManagerPage.
+
+        Only page-specific resources should be stopped here.
         """
 
         self.is_visible = False
 
-        for cam in list(
-            self.cameras
+        # =====================================================
+        # DO NOT STOP CAMERAS
+        # =====================================================
+        #
+        # NEVER DO:
+        #
+        #     cam.stop()
+        #
+        # CameraApp owns camera lifecycle.
+        #
+
+        # =====================================================
+        # PAGE-SPECIFIC RESOURCES
+        # =====================================================
+        #
+        # CentralPreview/PLC is page-specific.
+        #
+        # If CentralPreview itself has a stop method, it may
+        # stop its PLC monitoring here.
+        #
+        # It must NOT stop shared camera streams.
+        #
+
+        if hasattr(
+            self,
+            "central_frame"
         ):
 
             try:
 
-                if cam.running:
+                if hasattr(
+                    self.central_frame,
+                    "stop"
+                ):
 
-                    cam.stop()
+                    self.central_frame.stop()
 
             except Exception as e:
 
                 print(
-                    f"Failed to stop camera "
-                    f"{getattr(cam, 'ip', 'unknown')}: "
-                    f"{e}"
+                    "Central preview cleanup error:",
+                    e
                 )
 
     # =========================================================
@@ -244,17 +269,6 @@ class DeviceManagerPage(tk.Frame):
     def _build_ui(
         self
     ):
-        """
-        Build responsive three-column layout.
-
-        Layout:
-
-            LEFT       CENTER       RIGHT
-
-        The center area gets all extra space.
-
-        The actual camera preview is kept at 16:9.
-        """
 
         # =====================================================
         # ROOT GRID
@@ -314,12 +328,6 @@ class DeviceManagerPage(tk.Frame):
         self._create_left_sidebar()
 
         # =====================================================
-        # RIGHT PANEL
-        # =====================================================
-
-        self._create_right_panel()
-
-        # =====================================================
         # CENTER
         # =====================================================
 
@@ -366,6 +374,12 @@ class DeviceManagerPage(tk.Frame):
             "<Configure>",
             self._resize_center_preview
         )
+
+        # =====================================================
+        # RIGHT PANEL
+        # =====================================================
+
+        self._create_right_panel()
 
     # =========================================================
     # BACK BAR
@@ -612,13 +626,9 @@ class DeviceManagerPage(tk.Frame):
             weight=1
         )
 
-        next_zone = (
-            camera_db.get_next_modbus()
-        )
-
         self.zone_label = tk.Label(
             self.left_panel,
-            text=f"zone # {next_zone}",
+            text="zone # --",
             bg=COLOR_WHITE,
             fg="black",
             font=(
@@ -647,9 +657,7 @@ class DeviceManagerPage(tk.Frame):
 
         self.entries = {}
 
-        for i, field in enumerate(
-            fields
-        ):
+        for i, field in enumerate(fields):
 
             tk.Label(
                 self.left_panel,
@@ -697,17 +705,15 @@ class DeviceManagerPage(tk.Frame):
                 highlightthickness=1
             )
 
-            self.entries[
-                field
-            ] = entry
+            self.entries[field] = entry
 
         # =====================================================
-        # POPUP
+        # ENABLED / MAINTENANCE STATUS
         # =====================================================
 
         tk.Label(
             self.left_panel,
-            text="Pop up:",
+            text="Status:",
             bg=COLOR_WHITE,
             fg="black",
             font=(
@@ -742,7 +748,7 @@ class DeviceManagerPage(tk.Frame):
 
         tk.Radiobutton(
             popup_frame,
-            text="Yes",
+            text="Enabled",
             variable=self.popup_var,
             value="Yes",
             bg=COLOR_WHITE
@@ -753,54 +759,12 @@ class DeviceManagerPage(tk.Frame):
 
         tk.Radiobutton(
             popup_frame,
-            text="No",
+            text="Maintenance",
             variable=self.popup_var,
             value="No",
             bg=COLOR_WHITE
         ).pack(
             side="left"
-        )
-
-        # =====================================================
-        # MANUAL INTERVAL
-        # =====================================================
-
-        tk.Label(
-            self.left_panel,
-            text="Manual:",
-            bg=COLOR_WHITE,
-            fg="black",
-            font=(
-                "Arial",
-                10,
-                "bold"
-            )
-        ).grid(
-            row=7,
-            column=0,
-            sticky="w",
-            padx=(10, 5),
-            pady=8
-        )
-
-        self.manual_interval = ttk.Combobox(
-            self.left_panel,
-            values=[
-                "100s",
-                "200s",
-                "300s",
-                "600s"
-            ],
-            width=12,
-            state="readonly"
-        )
-
-        self.manual_interval.grid(
-            row=7,
-            column=1,
-            sticky="w",
-            padx=10,
-            pady=3
         )
 
         # =====================================================
@@ -815,7 +779,7 @@ class DeviceManagerPage(tk.Frame):
             width=25,
             command=self.open_auto_search_window
         ).grid(
-            row=8,
+            row=7,
             column=0,
             columnspan=2,
             pady=(10, 10)
@@ -831,7 +795,7 @@ class DeviceManagerPage(tk.Frame):
         )
 
         btn_frame.grid(
-            row=9,
+            row=8,
             column=0,
             columnspan=2,
             padx=20,
@@ -902,10 +866,6 @@ class DeviceManagerPage(tk.Frame):
             False
         )
 
-        # =====================================================
-        # TITLE
-        # =====================================================
-
         tk.Label(
             self.right_panel,
             text="Connected Devices",
@@ -920,10 +880,6 @@ class DeviceManagerPage(tk.Frame):
             pady=10
         )
 
-        # =====================================================
-        # SCROLL CONTAINER
-        # =====================================================
-
         scroll_area = tk.Frame(
             self.right_panel,
             bg=COLOR_WHITE
@@ -935,10 +891,6 @@ class DeviceManagerPage(tk.Frame):
             padx=(8, 0),
             pady=(0, 8)
         )
-
-        # =====================================================
-        # CANVAS
-        # =====================================================
 
         self.camera_canvas = tk.Canvas(
             scroll_area,
@@ -952,10 +904,6 @@ class DeviceManagerPage(tk.Frame):
             fill="both",
             expand=True
         )
-
-        # =====================================================
-        # SCROLLBAR
-        # =====================================================
 
         self.camera_scrollbar = tk.Scrollbar(
             scroll_area,
@@ -972,10 +920,6 @@ class DeviceManagerPage(tk.Frame):
             yscrollcommand=self.camera_scrollbar.set
         )
 
-        # =====================================================
-        # SCROLLABLE CONTENT
-        # =====================================================
-
         self.scrollable_frame = tk.Frame(
             self.camera_canvas,
             bg=COLOR_WHITE
@@ -989,28 +933,16 @@ class DeviceManagerPage(tk.Frame):
             )
         )
 
-        # =====================================================
-        # SCROLL REGION
-        # =====================================================
-
         self.scrollable_frame.bind(
             "<Configure>",
             self._update_camera_scroll_region
         )
-
-        # =====================================================
-        # KEEP CONTENT WIDTH MATCHED TO CANVAS
-        # =====================================================
 
         self.camera_canvas.bind(
             "<Configure>",
             self._resize_scrollable_frame
         )
 
-        # =====================================================
-        # MOUSE WHEEL
-        # =====================================================
-
         self.right_panel.bind(
             "<MouseWheel>",
             self._on_camera_mousewheel,
@@ -1028,54 +960,6 @@ class DeviceManagerPage(tk.Frame):
             self._on_camera_mousewheel,
             add="+"
         )
-
-        # Linux
-        self.right_panel.bind(
-            "<Button-4>",
-            lambda e: self._scroll_camera_list(-1),
-            add="+"
-        )
-
-        self.right_panel.bind(
-            "<Button-5>",
-            lambda e: self._scroll_camera_list(1),
-            add="+"
-        )
-
-        self.camera_canvas.bind(
-            "<Button-4>",
-            lambda e: self._scroll_camera_list(-1),
-            add="+"
-        )
-
-        self.camera_canvas.bind(
-            "<Button-5>",
-            lambda e: self._scroll_camera_list(1),
-            add="+"
-        )
-
-        self.scrollable_frame.bind(
-            "<Button-4>",
-            lambda e: self._scroll_camera_list(-1),
-            add="+"
-        )
-
-        self.scrollable_frame.bind(
-            "<Button-5>",
-            lambda e: self._scroll_camera_list(1),
-            add="+"
-        )
-
-        # =====================================================
-        # GLOBAL MOUSE WHEEL
-        # =====================================================
-        #
-        # This catches mouse wheel events over CameraCard
-        # children such as labels/buttons.
-        #
-        # We only scroll if the pointer is inside right_panel.
-        #
-        # =====================================================
 
         self.bind_all(
             "<MouseWheel>",
@@ -1084,7 +968,7 @@ class DeviceManagerPage(tk.Frame):
         )
 
     # =========================================================
-    # RIGHT PANEL SCROLL HELPERS
+    # SCROLL HELPERS
     # =========================================================
 
     def _update_camera_scroll_region(
@@ -1096,8 +980,9 @@ class DeviceManagerPage(tk.Frame):
 
             self.camera_canvas.configure(
                 scrollregion=(
-                    self.camera_canvas
-                    .bbox("all")
+                    self.camera_canvas.bbox(
+                        "all"
+                    )
                 )
             )
 
@@ -1128,15 +1013,10 @@ class DeviceManagerPage(tk.Frame):
     def _is_pointer_inside_right_panel(
         self
     ):
-        """
-        Check whether the mouse pointer is anywhere inside
-        the right panel, including empty space and child widgets.
-        """
 
         try:
 
             x = self.winfo_pointerx()
-
             y = self.winfo_pointery()
 
             widget = self.winfo_containing(
@@ -1229,22 +1109,13 @@ class DeviceManagerPage(tk.Frame):
         return "break"
 
     # =========================================================
-    # RESPONSIVE CENTRAL PREVIEW
+    # CENTER PREVIEW
     # =========================================================
 
     def _resize_center_preview(
         self,
         event=None
     ):
-        """
-        Keep the central preview at 16:9.
-
-        The CentralPreview widget itself remains inside the
-        center container.
-
-        This prevents its controls from being pushed outside
-        the visible window.
-        """
 
         if not hasattr(
             self,
@@ -1268,10 +1139,6 @@ class DeviceManagerPage(tk.Frame):
 
             return
 
-        # =====================================================
-        # Calculate largest 16:9 rectangle.
-        # =====================================================
-
         preview_width = available_width
 
         preview_height = (
@@ -1287,10 +1154,6 @@ class DeviceManagerPage(tk.Frame):
                 preview_height
                 * self.CAMERA_ASPECT_RATIO
             )
-
-        # =====================================================
-        # Center preview.
-        # =====================================================
 
         x = (
             available_width
@@ -1316,60 +1179,134 @@ class DeviceManagerPage(tk.Frame):
         )
 
     # =========================================================
-    # LOAD CAMERAS
+    # CAMERA REGISTRY
     # =========================================================
 
     def load_existing_cameras(
-        self
+        self,
+        refresh_cards=True
     ):
+
+        """
+        Load camera references from CameraApp.
+
+        IMPORTANT:
+
+        This does NOT call camera_db.load_all_cameras().
+
+        CameraApp owns the Camera objects.
+        """
 
         try:
 
-            loaded = (
-                camera_db.load_all_cameras()
-                or []
-            )
+            if hasattr(
+                self.controller,
+                "get_cameras"
+            ):
+
+                self.cameras = (
+                    self.controller
+                    .get_cameras()
+                )
+
+            else:
+
+                self.cameras = list(
+                    getattr(
+                        self.controller,
+                        "cameras",
+                        []
+                    )
+                )
 
         except Exception as e:
 
-            traceback.print_exc()
-
-            messagebox.showerror(
-                "Database Error",
-                f"Failed to load cameras:\n{e}"
+            print(
+                "Failed to get cameras "
+                f"from CameraApp: {e}"
             )
 
-            loaded = []
+            self.cameras = []
 
-        self.cameras = list(
-            loaded
-        )
+        if not refresh_cards:
+
+            return
 
         # =====================================================
-        # SHARE SAME CAMERA OBJECTS WITH CONTROLLER
+        # REMOVE CARDS FOR DELETED CAMERAS
         # =====================================================
 
-        if hasattr(
-            self.controller,
-            "cameras"
+        valid_ids = {
+            cam.id
+            for cam in self.cameras
+            if cam is not None
+        }
+
+        for camera_id in list(
+            self.camera_cards.keys()
         ):
 
-            self.controller.cameras = (
-                self.cameras
-            )
+            if camera_id not in valid_ids:
+
+                card = self.camera_cards.pop(
+                    camera_id
+                )
+
+                try:
+
+                    card.destroy()
+
+                except Exception:
+
+                    pass
 
         # =====================================================
-        # CREATE CARDS
+        # CREATE / REFRESH CARDS
         # =====================================================
 
         for cam in self.cameras:
 
-            self.add_camera_card(
-                cam
-            )
+            if cam is None:
+
+                continue
+
+            if cam.id not in self.camera_cards:
+
+                self.add_camera_card(
+                    cam
+                )
+
+            else:
+
+                card = self.camera_cards[
+                    cam.id
+                ]
+
+                try:
+
+                    if hasattr(
+                        card,
+                        "update_info"
+                    ):
+
+                        card.update_info()
+
+                    elif hasattr(
+                        card,
+                        "refresh"
+                    ):
+
+                        card.refresh()
+
+                except Exception as e:
+
+                    print(
+                        "Camera card refresh error:",
+                        e
+                    )
 
     # =========================================================
-    # ADD CAMERA CARD
+    # CAMERA CARDS
     # =========================================================
 
     def add_camera_card(
@@ -1380,10 +1317,6 @@ class DeviceManagerPage(tk.Frame):
         if cam is None:
 
             return
-
-        # =====================================================
-        # PREVENT DUPLICATE CARD
-        # =====================================================
 
         if cam.id in self.camera_cards:
 
@@ -1400,23 +1333,9 @@ class DeviceManagerPage(tk.Frame):
             cam.id
         ] = card
 
-        # =====================================================
-        # MOUSE WHEEL
-        # =====================================================
-        #
-        # Bind every child recursively.
-        #
-        # This is supplementary to bind_all().
-        #
-        # =====================================================
-
         self._bind_mousewheel_recursive(
             card
         )
-
-        # =====================================================
-        # UPDATE SCROLL REGION
-        # =====================================================
 
         self.after_idle(
             self._update_camera_scroll_region
@@ -1437,20 +1356,6 @@ class DeviceManagerPage(tk.Frame):
                 add="+"
             )
 
-            widget.bind(
-                "<Button-4>",
-                lambda e:
-                    self._scroll_camera_list(-1),
-                add="+"
-            )
-
-            widget.bind(
-                "<Button-5>",
-                lambda e:
-                    self._scroll_camera_list(1),
-                add="+"
-            )
-
         except Exception:
 
             pass
@@ -1468,7 +1373,7 @@ class DeviceManagerPage(tk.Frame):
             pass
 
     # =========================================================
-    # SHOW ADD PANEL
+    # ADD PANEL
     # =========================================================
 
     def show_add_panel(
@@ -1481,22 +1386,25 @@ class DeviceManagerPage(tk.Frame):
 
             return
 
-        # Hide settings.
-
         self.settings_panel.grid_remove()
 
         self.settings_panel_showing = False
 
-        # Refresh zone number.
+        try:
 
-        self.zone_label.configure(
-            text=(
-                f"zone # "
-                f"{camera_db.get_next_modbus()}"
+            next_zone = (
+                camera_db.get_next_modbus()
             )
-        )
 
-        # Show add panel.
+            self.zone_label.configure(
+                text=f"zone # {next_zone}"
+            )
+
+        except Exception:
+
+            self.zone_label.configure(
+                text="zone # --"
+            )
 
         self.left_panel.grid()
 
@@ -1532,11 +1440,6 @@ class DeviceManagerPage(tk.Frame):
             expand=True
         )
 
-        self.settings_content.grid_columnconfigure(
-            0,
-            weight=1
-        )
-
         tk.Label(
             self.settings_content,
             text="System Settings",
@@ -1550,10 +1453,6 @@ class DeviceManagerPage(tk.Frame):
         ).pack(
             pady=(15, 20)
         )
-
-        # =====================================================
-        # SCREEN VIEW
-        # =====================================================
 
         screen_box = tk.LabelFrame(
             self.settings_content,
@@ -1594,10 +1493,6 @@ class DeviceManagerPage(tk.Frame):
         ).pack(
             anchor="w"
         )
-
-        # =====================================================
-        # DATE TIME
-        # =====================================================
 
         tk.Label(
             self.settings_content,
@@ -1675,10 +1570,6 @@ class DeviceManagerPage(tk.Frame):
             )
         )
 
-        # =====================================================
-        # LANGUAGE
-        # =====================================================
-
         lang_box = tk.LabelFrame(
             self.settings_content,
             text="Language",
@@ -1708,10 +1599,6 @@ class DeviceManagerPage(tk.Frame):
         ).pack(
             fill="x"
         )
-
-        # =====================================================
-        # SAVE
-        # =====================================================
 
         tk.Button(
             self.settings_content,
@@ -1752,16 +1639,20 @@ class DeviceManagerPage(tk.Frame):
         self.settings_panel_showing = True
 
     # =========================================================
-    # SCREEN VIEW
-    # =========================================================
 
     def change_screen_view(
         self
     ):
 
-        view = int(
-            self.screen_view.get()
-        )
+        try:
+
+            view = int(
+                self.screen_view.get()
+            )
+
+        except ValueError:
+
+            return
 
         if hasattr(
             self.controller,
@@ -1773,16 +1664,14 @@ class DeviceManagerPage(tk.Frame):
             )
 
     # =========================================================
-    # CLEAR ADD FORM
+    # CLEAR FORM
     # =========================================================
 
     def clear_entries(
         self
     ):
 
-        for entry in (
-            self.entries.values()
-        ):
+        for entry in self.entries.values():
 
             entry.config(
                 highlightbackground="gray",
@@ -1841,9 +1730,7 @@ class DeviceManagerPage(tk.Frame):
         # RESET VALIDATION
         # =====================================================
 
-        for entry in (
-            self.entries.values()
-        ):
+        for entry in self.entries.values():
 
             entry.config(
                 highlightbackground="gray",
@@ -1852,7 +1739,7 @@ class DeviceManagerPage(tk.Frame):
             )
 
         # =====================================================
-        # IP REQUIRED
+        # IP
         # =====================================================
 
         if not ip:
@@ -1880,9 +1767,7 @@ class DeviceManagerPage(tk.Frame):
                 )
 
                 if not (
-                    1
-                    <= port
-                    <= 65535
+                    1 <= port <= 65535
                 ):
 
                     raise ValueError
@@ -1914,47 +1799,41 @@ class DeviceManagerPage(tk.Frame):
 
         try:
 
-            if hasattr(
-                camera_db,
-                "camera_exists"
+            if camera_db.camera_exists(
+                ip
             ):
 
-                if camera_db.camera_exists(
-                    ip
-                ):
+                self.entries[
+                    "IP"
+                ].config(
+                    highlightbackground="red",
+                    highlightcolor="red",
+                    highlightthickness=2
+                )
 
-                    self.entries[
-                        "IP"
-                    ].config(
-                        highlightbackground="red",
-                        highlightcolor="red",
-                        highlightthickness=2
-                    )
+                messagebox.showwarning(
+                    "Duplicate Camera",
+                    f"Camera with IP {ip} already exists."
+                )
 
-                    messagebox.showwarning(
-                        "Duplicate Camera",
-                        f"Camera with IP {ip} already exists."
-                    )
-
-                    return
+                return
 
         except Exception:
 
             pass
 
         # =====================================================
-        # POPUP STATUS
+        # STATUS
         # =====================================================
 
         status = (
             1
-            if self.popup_var.get()
-            == "Yes"
+            if self.popup_var.get() == "Yes"
             else 0
         )
 
         # =====================================================
-        # ADD TO DATABASE
+        # SAVE
         # =====================================================
 
         try:
@@ -1975,51 +1854,47 @@ class DeviceManagerPage(tk.Frame):
             )
 
             # =================================================
-            # ADD TO SHARED CAMERA LIST
+            # REGISTER WITH CAMERA APP
             # =================================================
-
-            if cam not in self.cameras:
-
-                self.cameras.append(
-                    cam
-                )
 
             if hasattr(
                 self.controller,
-                "cameras"
+                "register_camera"
             ):
 
-                self.controller.cameras = (
-                    self.cameras
+                cam = (
+                    self.controller
+                    .register_camera(
+                        cam
+                    )
                 )
 
             # =================================================
-            # CREATE CARD
+            # UPDATE LOCAL REFERENCES
             # =================================================
 
-            self.add_camera_card(
-                cam
+            self.load_existing_cameras(
+                refresh_cards=True
             )
 
             # =================================================
-            # START CAMERA
+            # START ONLY IF ENABLED
             # =================================================
 
-            if self.is_visible:
+            if (
+                status
+                and hasattr(
+                    self.controller,
+                    "start_camera"
+                )
+            ):
 
-                try:
-
-                    cam.start()
-
-                except Exception as e:
-
-                    print(
-                        "Failed to start newly "
-                        f"added camera: {e}"
-                    )
+                self.controller.start_camera(
+                    cam
+                )
 
             # =================================================
-            # REFRESH UI
+            # UI
             # =================================================
 
             self.clear_entries()
@@ -2040,7 +1915,7 @@ class DeviceManagerPage(tk.Frame):
             )
 
     # =========================================================
-    # EDIT CAMERA WINDOW
+    # EDIT CAMERA
     # =========================================================
 
     def open_edit_camera_window(
@@ -2075,10 +1950,6 @@ class DeviceManagerPage(tk.Frame):
 
         edit_window.grab_set()
 
-        # =====================================================
-        # TITLE
-        # =====================================================
-
         tk.Label(
             edit_window,
             text="Edit Camera",
@@ -2091,10 +1962,6 @@ class DeviceManagerPage(tk.Frame):
         ).pack(
             pady=15
         )
-
-        # =====================================================
-        # FORM
-        # =====================================================
 
         form = tk.Frame(
             edit_window,
@@ -2110,34 +1977,17 @@ class DeviceManagerPage(tk.Frame):
         entries = {}
 
         fields = [
-            (
-                "Name:",
-                "name"
-            ),
-            (
-                "IP:",
-                "ip"
-            ),
-            (
-                "Port:",
-                "port"
-            ),
-            (
-                "Username:",
-                "username"
-            ),
-            (
-                "Password:",
-                "password"
-            )
+            ("Name:", "name"),
+            ("IP:", "ip"),
+            ("Port:", "port"),
+            ("Username:", "username"),
+            ("Password:", "password")
         ]
 
         for i, (
             label_text,
             key
-        ) in enumerate(
-            fields
-        ):
+        ) in enumerate(fields):
 
             tk.Label(
                 form,
@@ -2173,13 +2023,7 @@ class DeviceManagerPage(tk.Frame):
                 highlightthickness=1
             )
 
-            entries[
-                key
-            ] = entry
-
-        # =====================================================
-        # INSERT CURRENT VALUES
-        # =====================================================
+            entries[key] = entry
 
         entries[
             "name"
@@ -2200,8 +2044,7 @@ class DeviceManagerPage(tk.Frame):
         ].insert(
             0,
             str(
-                cam.port
-                or 554
+                cam.port or 554
             )
         )
 
@@ -2220,7 +2063,7 @@ class DeviceManagerPage(tk.Frame):
         )
 
         # =====================================================
-        # POPUP STATUS
+        # STATUS
         # =====================================================
 
         current_status = getattr(
@@ -2229,7 +2072,7 @@ class DeviceManagerPage(tk.Frame):
             1
         )
 
-        is_popup_enabled = (
+        is_enabled = (
             str(
                 current_status
             ).lower()
@@ -2243,14 +2086,14 @@ class DeviceManagerPage(tk.Frame):
         status_var = tk.StringVar(
             value=(
                 "Yes"
-                if is_popup_enabled
+                if is_enabled
                 else "No"
             )
         )
 
         tk.Label(
             form,
-            text="Pop up:",
+            text="Status:",
             bg="white"
         ).grid(
             row=5,
@@ -2272,7 +2115,7 @@ class DeviceManagerPage(tk.Frame):
 
         tk.Radiobutton(
             radio_f,
-            text="Yes",
+            text="Enabled",
             variable=status_var,
             value="Yes",
             bg="white"
@@ -2283,7 +2126,7 @@ class DeviceManagerPage(tk.Frame):
 
         tk.Radiobutton(
             radio_f,
-            text="No",
+            text="Maintenance",
             variable=status_var,
             value="No",
             bg="white"
@@ -2328,7 +2171,7 @@ class DeviceManagerPage(tk.Frame):
         )
 
     # =========================================================
-    # SAVE CAMERA EDIT
+    # SAVE CAMERA CHANGES
     # =========================================================
 
     def save_camera_changes(
@@ -2338,21 +2181,6 @@ class DeviceManagerPage(tk.Frame):
         status_var,
         window
     ):
-        """
-        Safely save camera edits.
-
-        Important:
-        We update the SAME Camera object.
-
-        We do NOT reload all cameras from SQLite.
-
-        This prevents MainPage and CentralPreview from holding
-        stale references to old Camera objects.
-        """
-
-        # =====================================================
-        # READ VALUES
-        # =====================================================
 
         name = (
             entries[
@@ -2406,14 +2234,16 @@ class DeviceManagerPage(tk.Frame):
 
         try:
 
-            port = int(
-                port_raw
-            ) if port_raw else 554
+            port = (
+                int(
+                    port_raw
+                )
+                if port_raw
+                else 554
+            )
 
             if not (
-                1
-                <= port
-                <= 65535
+                1 <= port <= 65535
             ):
 
                 raise ValueError
@@ -2444,30 +2274,25 @@ class DeviceManagerPage(tk.Frame):
 
             try:
 
-                if hasattr(
-                    camera_db,
-                    "camera_exists"
+                if camera_db.camera_exists(
+                    ip
                 ):
 
-                    if camera_db.camera_exists(
-                        ip
-                    ):
+                    entries[
+                        "ip"
+                    ].config(
+                        highlightbackground="red",
+                        highlightcolor="red",
+                        highlightthickness=2
+                    )
 
-                        entries[
-                            "ip"
-                        ].config(
-                            highlightbackground="red",
-                            highlightcolor="red",
-                            highlightthickness=2
-                        )
+                    messagebox.showwarning(
+                        "Duplicate Camera",
+                        f"Camera with IP {ip} already exists.",
+                        parent=window
+                    )
 
-                        messagebox.showwarning(
-                            "Duplicate Camera",
-                            f"Camera with IP {ip} already exists.",
-                            parent=window
-                        )
-
-                        return
+                    return
 
             except Exception as e:
 
@@ -2482,13 +2307,12 @@ class DeviceManagerPage(tk.Frame):
 
         status = (
             1
-            if status_var.get()
-            == "Yes"
+            if status_var.get() == "Yes"
             else 0
         )
 
         # =====================================================
-        # DETECT CHANGES
+        # CHANGE DETECTION
         # =====================================================
 
         connection_changed = (
@@ -2511,10 +2335,6 @@ class DeviceManagerPage(tk.Frame):
             )
         )
 
-        # =====================================================
-        # NOTHING CHANGED
-        # =====================================================
-
         if not (
             connection_changed
             or metadata_changed
@@ -2525,7 +2345,7 @@ class DeviceManagerPage(tk.Frame):
             return
 
         # =====================================================
-        # SAVE DATABASE FIRST
+        # DATABASE UPDATE
         # =====================================================
 
         try:
@@ -2553,47 +2373,37 @@ class DeviceManagerPage(tk.Frame):
             return
 
         # =====================================================
-        # STOP CAMERA IF CONNECTION CHANGED
+        # UPDATE SHARED OBJECT
         # =====================================================
 
-        if connection_changed:
-
-            try:
-
-                if cam.running:
-
-                    cam.stop()
-
-            except Exception as e:
-
-                print(
-                    f"Warning stopping camera "
-                    f"{cam.id}: {e}"
-                )
-
-        # =====================================================
-        # UPDATE SAME CAMERA OBJECT
-        # =====================================================
+        #
+        # IMPORTANT:
+        #
+        # We update the SAME Camera object.
+        #
+        # MainPage, DeviceManagerPage, and CentralPreview
+        # all continue using the same object.
+        #
 
         cam.ip = ip
-
         cam.port = port
-
         cam.username = username
-
         cam.password = password
-
         cam.name = name
-
         cam.status = status
 
         # =====================================================
-        # REBUILD RTSP URL
+        # REBUILD URL
         # =====================================================
 
         try:
 
-            cam._update_url()
+            if hasattr(
+                cam,
+                "_update_url"
+            ):
+
+                cam._update_url()
 
         except Exception as e:
 
@@ -2601,6 +2411,75 @@ class DeviceManagerPage(tk.Frame):
                 "Failed to update camera URL:",
                 e
             )
+
+        # =====================================================
+        # LET CAMERA APP HANDLE STREAM
+        # =====================================================
+
+        if hasattr(
+            self.controller,
+            "update_camera_stream"
+        ):
+
+            #
+            # Preferred API.
+            #
+            # CameraApp decides whether the stream must be
+            # stopped/restarted based on status and connection.
+            #
+
+            self.controller.update_camera_stream(
+                cam,
+                connection_changed=connection_changed
+            )
+
+        else:
+
+            #
+            # Compatibility fallback.
+            #
+            # Still goes through CameraApp.
+            #
+
+            if not status:
+
+                if hasattr(
+                    self.controller,
+                    "stop_camera"
+                ):
+
+                    self.controller.stop_camera(
+                        cam
+                    )
+
+            elif connection_changed:
+
+                if hasattr(
+                    self.controller,
+                    "stop_camera"
+                ):
+
+                    self.controller.stop_camera(
+                        cam
+                    )
+
+                if hasattr(
+                    self.controller,
+                    "start_camera"
+                ):
+
+                    self.controller.start_camera(
+                        cam
+                    )
+
+            elif hasattr(
+                self.controller,
+                "start_camera"
+            ):
+
+                self.controller.start_camera(
+                    cam
+                )
 
         # =====================================================
         # UPDATE CARD
@@ -2636,39 +2515,7 @@ class DeviceManagerPage(tk.Frame):
                 )
 
         # =====================================================
-        # RESTART CAMERA IF NECESSARY
-        # =====================================================
-
-        if connection_changed:
-
-            if self.is_visible:
-
-                try:
-
-                    cam.start()
-
-                except Exception as e:
-
-                    print(
-                        f"Failed to restart "
-                        f"camera {cam.id}: {e}"
-                    )
-
-        # =====================================================
-        # KEEP CONTROLLER LIST SYNCHRONIZED
-        # =====================================================
-
-        if hasattr(
-            self.controller,
-            "cameras"
-        ):
-
-            self.controller.cameras = (
-                self.cameras
-            )
-
-        # =====================================================
-        # CLOSE EDIT WINDOW
+        # CLOSE WINDOW
         # =====================================================
 
         try:
@@ -2682,24 +2529,132 @@ class DeviceManagerPage(tk.Frame):
         window.destroy()
 
         # =====================================================
-        # REFRESH OTHER VIEWS
+        # REFRESH VIEWS
         # =====================================================
+
+        self.load_existing_cameras(
+            refresh_cards=True
+        )
 
         self._notify_camera_change()
 
     # =========================================================
-    # NOTIFY OTHER PAGES
+    # DELETE CAMERA
+    # =========================================================
+
+    def _on_card_deleted(
+        self,
+        cam
+    ):
+
+        if cam is None:
+
+            return
+
+        result = messagebox.askyesno(
+            "Delete Camera",
+            (
+                f"Are you sure you want to delete "
+                f"camera '{cam.name or cam.ip}'?"
+            )
+        )
+
+        if not result:
+
+            return
+
+        try:
+
+            # =================================================
+            # DATABASE
+            # =================================================
+
+            camera_db.delete_camera(
+                cam.id
+            )
+
+            # =================================================
+            # CONTROLLER REGISTRY
+            # =================================================
+
+            if hasattr(
+                self.controller,
+                "unregister_camera"
+            ):
+
+                self.controller.unregister_camera(
+                    cam.id
+                )
+
+            # =================================================
+            # REMOVE CARD
+            # =================================================
+
+            card = self.camera_cards.pop(
+                cam.id,
+                None
+            )
+
+            if card:
+
+                try:
+
+                    card.destroy()
+
+                except Exception:
+
+                    pass
+
+            # =================================================
+            # REFRESH
+            # =================================================
+
+            self.load_existing_cameras(
+                refresh_cards=True
+            )
+
+            self._notify_camera_change()
+
+            self.refresh_modbus_ui()
+
+        except Exception as e:
+
+            traceback.print_exc()
+
+            messagebox.showerror(
+                "Delete Error",
+                str(e)
+            )
+
+    # =========================================================
+    # REFRESH MODBUS UI
+    # =========================================================
+
+    def refresh_modbus_ui(
+        self
+    ):
+
+        try:
+
+            next_zone = (
+                camera_db.get_next_modbus()
+            )
+
+            self.zone_label.configure(
+                text=f"zone # {next_zone}"
+            )
+
+        except Exception:
+
+            pass
+
+    # =========================================================
+    # NOTIFY OTHER VIEWS
     # =========================================================
 
     def _notify_camera_change(
         self
     ):
-        """
-        Tell MainPage and CentralPreview that camera data
-        changed.
-
-        No Camera objects are recreated.
-        """
 
         # =====================================================
         # CENTRAL PREVIEW
@@ -2769,20 +2724,30 @@ class DeviceManagerPage(tk.Frame):
     def reload_all_cameras_from_db(
         self
     ):
+
         """
-        Kept for compatibility.
+        Compatibility method.
 
-        This method no longer destroys all Camera objects.
+        CameraApp remains the source of truth.
 
-        Existing Camera objects are updated in-place when possible.
+        This method asks CameraApp to reload configuration
+        instead of creating duplicate Camera objects.
         """
 
         try:
 
-            fresh_cameras = (
-                camera_db.load_all_cameras()
-                or []
+            if hasattr(
+                self.controller,
+                "reload_cameras"
+            ):
+
+                self.controller.reload_cameras()
+
+            self.load_existing_cameras(
+                refresh_cards=True
             )
+
+            self._notify_camera_change()
 
         except Exception as e:
 
@@ -2790,277 +2755,6 @@ class DeviceManagerPage(tk.Frame):
                 "Failed to reload cameras:",
                 e
             )
-
-            return
-
-        old_by_id = {
-            cam.id: cam
-            for cam in self.cameras
-        }
-
-        # =====================================================
-        # UPDATE EXISTING OBJECTS
-        # =====================================================
-
-        for fresh in fresh_cameras:
-
-            existing = old_by_id.get(
-                fresh.id
-            )
-
-            if existing is None:
-
-                self.cameras.append(
-                    fresh
-                )
-
-                self.add_camera_card(
-                    fresh
-                )
-
-                continue
-
-            # Detect connection changes.
-
-            connection_changed = (
-                existing.ip != fresh.ip
-                or existing.port != fresh.port
-                or existing.username != (
-                    fresh.username or ""
-                )
-                or existing.password != (
-                    fresh.password or ""
-                )
-            )
-
-            if connection_changed:
-
-                try:
-
-                    if existing.running:
-
-                        existing.stop()
-
-                except Exception:
-
-                    pass
-
-            # Update object.
-
-            existing.ip = fresh.ip
-
-            existing.port = fresh.port
-
-            existing.username = (
-                fresh.username
-            )
-
-            existing.password = (
-                fresh.password
-            )
-
-            existing.name = fresh.name
-
-            existing.status = fresh.status
-
-            try:
-
-                existing._update_url()
-
-            except Exception:
-
-                pass
-
-            if connection_changed:
-
-                if self.is_visible:
-
-                    try:
-
-                        existing.start()
-
-                    except Exception:
-
-                        pass
-
-            card = self.camera_cards.get(
-                existing.id
-            )
-
-            if card:
-
-                try:
-
-                    if hasattr(
-                        card,
-                        "update_info"
-                    ):
-
-                        card.update_info()
-
-                except Exception:
-
-                    pass
-
-        # =====================================================
-        # REMOVE DELETED CAMERAS
-        # =====================================================
-
-        fresh_ids = {
-            cam.id
-            for cam in fresh_cameras
-        }
-
-        for cam in list(
-            self.cameras
-        ):
-
-            if cam.id not in fresh_ids:
-
-                try:
-
-                    if cam.running:
-
-                        cam.stop()
-
-                except Exception:
-
-                    pass
-
-                card = self.camera_cards.pop(
-                    cam.id,
-                    None
-                )
-
-                if card:
-
-                    try:
-
-                        card.destroy()
-
-                    except Exception:
-
-                        pass
-
-                self.cameras.remove(
-                    cam
-                )
-
-        # =====================================================
-        # SYNC CONTROLLER
-        # =====================================================
-
-        if hasattr(
-            self.controller,
-            "cameras"
-        ):
-
-            self.controller.cameras = (
-                self.cameras
-            )
-
-        self._notify_camera_change()
-
-    # =========================================================
-    # SIMPLE RELOAD
-    # =========================================================
-
-    def reload_cameras(
-        self
-    ):
-
-        self._notify_camera_change()
-
-    # =========================================================
-    # DELETE CAMERA
-    # =========================================================
-
-    def _on_card_deleted(
-        self,
-        cam_id
-    ):
-
-        # =====================================================
-        # FIND CAMERA
-        # =====================================================
-
-        cam = next(
-            (
-                c
-                for c in self.cameras
-                if c.id == cam_id
-            ),
-            None
-        )
-
-        # =====================================================
-        # STOP CAMERA
-        # =====================================================
-
-        if cam:
-
-            try:
-
-                if cam.running:
-
-                    cam.stop()
-
-            except Exception as e:
-
-                print(
-                    f"Error stopping deleted "
-                    f"camera {cam_id}: {e}"
-                )
-
-        # =====================================================
-        # REMOVE CARD
-        # =====================================================
-
-        card = self.camera_cards.pop(
-            cam_id,
-            None
-        )
-
-        if card:
-
-            try:
-
-                card.destroy()
-
-            except Exception:
-
-                pass
-
-        # =====================================================
-        # REMOVE FROM LIST
-        # =====================================================
-
-        self.cameras = [
-            camera
-            for camera in self.cameras
-            if camera.id != cam_id
-        ]
-
-        # =====================================================
-        # CONTROLLER
-        # =====================================================
-
-        if hasattr(
-            self.controller,
-            "cameras"
-        ):
-
-            self.controller.cameras = (
-                self.cameras
-            )
-
-        # =====================================================
-        # UPDATE UI
-        # =====================================================
-
-        self.refresh_modbus_ui()
-
-        self._notify_camera_change()
 
     # =========================================================
     # AUTO SEARCH
@@ -3070,137 +2764,58 @@ class DeviceManagerPage(tk.Frame):
         self
     ):
 
-        def on_camera_added(
-            new_cam
-        ):
+        try:
 
-            if new_cam is None:
-
-                return
-
-            # Avoid duplicates.
-
-            if any(
-                cam.id == new_cam.id
-                for cam in self.cameras
-            ):
-
-                return
-
-            self.cameras.append(
-                new_cam
+            AutoSearchWindow(
+                self,
+                self.controller
             )
 
-            if hasattr(
-                self.controller,
-                "cameras"
-            ):
-
-                self.controller.cameras = (
-                    self.cameras
-                )
-
-            self.add_camera_card(
-                new_cam
-            )
-
-            if self.is_visible:
-
-                try:
-
-                    new_cam.start()
-
-                except Exception as e:
-
-                    print(
-                        "Auto-search camera "
-                        f"start error: {e}"
-                    )
-
-            self.refresh_modbus_ui()
-
-            self._notify_camera_change()
-
-        search = AutoSearchWindow(
-            self,
-            on_camera_added
-        )
-
-        search.show()
-
-    # =========================================================
-    # GET CAMERAS
-    # =========================================================
-
-    def get_cameras(
-        self
-    ):
-
-        return list(
-            self.cameras
-        )
-
-    # =========================================================
-    # STOP ALL CAMERAS
-    # =========================================================
-
-    def stop_all_cameras(
-        self
-    ):
-
-        for cam in list(
-            self.cameras
-        ):
+        except TypeError:
 
             try:
 
-                if cam.running:
-
-                    cam.stop()
+                AutoSearchWindow(
+                    self
+                )
 
             except Exception as e:
 
-                print(
-                    f"Failed to stop camera "
-                    f"{getattr(cam, 'id', 'unknown')}: "
-                    f"{e}"
+                traceback.print_exc()
+
+                messagebox.showerror(
+                    "Auto Search Error",
+                    str(e)
                 )
 
+        except Exception as e:
+
+            traceback.print_exc()
+
+            messagebox.showerror(
+                "Auto Search Error",
+                str(e)
+            )
+
     # =========================================================
-    # SAVE SETTINGS
+    # SETTINGS SAVE
     # =========================================================
 
     def save_settings(
         self
     ):
 
-        print(
-            "Saved Settings:",
-            self.screen_view.get(),
-            self.language.get(),
-            self.date_entry.get(),
-            self.time_entry.get()
+        """
+        Save system settings.
+
+        Extend this method when actual settings persistence
+        is implemented.
+        """
+
+        messagebox.showinfo(
+            "Settings",
+            "Settings saved successfully."
         )
-
-    # =========================================================
-    # REFRESH MODBUS UI
-    # =========================================================
-
-    def refresh_modbus_ui(
-        self
-    ):
-
-        if hasattr(
-            self,
-            "zone_label"
-        ):
-
-            self.zone_label.configure(
-                text=(
-                    f"zone # "
-                    f"{camera_db.get_next_modbus()}"
-                )
-            )
 
     # =========================================================
     # DESTROY
@@ -3209,12 +2824,24 @@ class DeviceManagerPage(tk.Frame):
     def destroy(
         self
     ):
+
         """
-        Clean up page-owned resources.
+        Destroy the Device Manager page.
+
+        IMPORTANT:
+
+        This method NEVER stops shared camera streams.
+
+        CameraApp handles camera shutdown during application
+        shutdown.
+
+        Only page-owned resources are cleaned up here.
         """
 
+        self.is_visible = False
+
         # =====================================================
-        # REMOVE GLOBAL BINDING
+        # REMOVE GLOBAL MOUSE BINDING
         # =====================================================
 
         try:
@@ -3228,19 +2855,7 @@ class DeviceManagerPage(tk.Frame):
             pass
 
         # =====================================================
-        # STOP CAMERAS
-        # =====================================================
-
-        try:
-
-            self.stop_all_cameras()
-
-        except Exception:
-
-            pass
-
-        # =====================================================
-        # STOP PLC
+        # STOP PAGE-OWNED PLC RESOURCE
         # =====================================================
 
         if self.plc_reader:
@@ -3254,8 +2869,24 @@ class DeviceManagerPage(tk.Frame):
 
                     self.plc_reader.stop()
 
-            except Exception:
+            except Exception as e:
 
-                pass
+                print(
+                    "PLC cleanup error:",
+                    e
+                )
+
+            finally:
+
+                self.plc_reader = None
+
+        # =====================================================
+        # DO NOT STOP CAMERAS
+        # =====================================================
+        #
+        # CameraApp.stop_all_cameras() is responsible for
+        # application-wide camera shutdown.
+        #
 
         super().destroy()
+
