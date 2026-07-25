@@ -1013,7 +1013,6 @@ class MainPage(tk.Frame):
             # =================================================
             # START CAMERA WORKERS
             # =================================================
-
             for cam in selected:
 
                 try:
